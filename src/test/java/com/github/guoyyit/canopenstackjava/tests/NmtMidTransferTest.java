@@ -55,6 +55,14 @@ class NmtMidTransferTest {
         raw.uploadSegmentRequest(1, 1);
         assertEquals(0, raw.responseCount());
 
+        // 同步客户端在 STOPPED 期间发起传输：快速超时失败而不悬挂，
+        // 客户端中止帧被忽略，双方均不残留状态。
+        SdoClient stalledClient = new SdoClient(network.getBus(), network.getClock());
+        org.junit.jupiter.api.Assertions.assertThrows(
+                com.github.guoyyit.canopenstackjava.canopen.sdo.SdoException.class,
+                () -> stalledClient.upload(1, 0x2100, 0));
+        assertEquals(0, node.getSdoServer().activeSessionCount());
+
         // 复位通信后 SDO 通道立即可用，且读出数据完整一致。
         master.sendCommand(NmtCommand.RESET_COMMUNICATION, 1);
         assertEquals(NmtState.PRE_OPERATIONAL, node.getState());
@@ -62,6 +70,7 @@ class NmtMidTransferTest {
         assertArrayEquals(data, client.upload(1, 0x2100, 0));
         assertEquals(0, node.getSdoServer().activeSessionCount());
 
+        stalledClient.shutdown();
         client.shutdown();
         network.shutdown();
     }
