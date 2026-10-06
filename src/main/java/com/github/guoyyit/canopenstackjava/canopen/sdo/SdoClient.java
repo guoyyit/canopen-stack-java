@@ -69,7 +69,13 @@ public class SdoClient implements CanBusListener {
         byte[] response = request(nodeId, index, subindex, initiate);
 
         int command = response[0] & 0xFF;
-        if (command == 0x43 || (command & 0xF0) == 0x40) {
+        if ((command & 0xE0) == 0x40) {
+            // 应答必须引用本次请求的对象，防止陈旧/串对象应答被当作本次结果。
+            if (u16(response, 1) != index || (response[3] & 0xFF) != subindex) {
+                sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
+                throw new SdoException(AbortCode.SDO_PROTOCOL_ERROR,
+                        "upload initiate response references different object");
+            }
             boolean expedited = (command & 0x02) != 0;
             if (expedited) {
                 int n = (command >>> 2) & 0x03;
@@ -81,33 +87,35 @@ public class SdoClient implements CanBusListener {
             int totalSize = u32(response, 4);
             return uploadSegments(nodeId, index, subindex, totalSize);
         }
+        sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
         throw new SdoException(AbortCode.SDO_PROTOCOL_ERROR,
                 "unexpected upload initiate response 0x" + Integer.toHexString(command));
     }
 
     public void download(int nodeId, int index, int subindex, byte[] data) {
         byte[] initiate = new byte[8];
-        if (data.length <= 4) {
+        if (data.length >= 1 && data.length <= 4) {
             int n = 4 - data.length;
             initiate[0] = (byte) (0x23 | (n << 2) | 0x02 | 0x01);
             putIndex(initiate, index, subindex);
             System.arraycopy(data, 0, initiate, 4, data.length);
             byte[] response = request(nodeId, index, subindex, initiate);
-            expectAck(response, index, subindex, 0x60);
+            expectAck(nodeId, response, index, subindex, 0x60);
             return;
         }
 
+        // 0 字节或超过 4 字节走分段传输；0 字节时发送一个空末段。
         initiate[0] = 0x21;
         putIndex(initiate, index, subindex);
         writeU32(initiate, 4, data.length);
         byte[] response = request(nodeId, index, subindex, initiate);
-        expectAck(response, index, subindex, 0x60);
+        expectAck(nodeId, response, index, subindex, 0x60);
 
         int offset = 0;
         int toggle = 0;
-        while (offset < data.length) {
+        do {
             int chunk = Math.min(7, data.length - offset);
-            boolean last = offset + chunk == data.length;
+            boolean last = offset + chunk >= data.length;
             int unused = 7 - chunk;
             byte[] segment = new byte[8];
             segment[0] = (byte) (0x00 | (toggle << 4) | (unused << 1) | (last ? 0x01 : 0x00));
@@ -116,11 +124,12 @@ public class SdoClient implements CanBusListener {
             int expected = 0x20 | (toggle << 4);
             // 下载段应答不携带索引/子索引，仅校验命令字节与 toggle。
             if ((response[0] & 0xFF) != expected) {
+                sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
                 throw protocolError(response[0] & 0xFF);
             }
             toggle ^= 1;
             offset += chunk;
-        }
+        } while (offset < data.length);
     }
 
     public void abort(int nodeId, int index, int subindex, AbortCode code) {
@@ -136,14 +145,17 @@ public class SdoClient implements CanBusListener {
         int toggle = 0;
         while (true) {
             byte[] requestFrame = new byte[8];
-            requestFrame[0] = 0x60;
+            // CiA 301：上传段请求为 0x60 | (toggle << 4)，服务器据此识别重复请求。
+            requestFrame[0] = (byte) (0x60 | (toggle << 4));
             byte[] response = request(nodeId, index, subindex, requestFrame);
             int command = response[0] & 0xFF;
             if ((command & 0xE0) != 0x00) {
+                sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
                 throw protocolError(command);
             }
             int responseToggle = (command >>> 4) & 0x01;
             if (responseToggle != toggle) {
+                sendAbort(nodeId, index, subindex, AbortCode.TOGGLE_BIT_INVALID);
                 throw new SdoException(AbortCode.TOGGLE_BIT_INVALID,
                         "bad toggle in upload segment");
             }
@@ -152,7 +164,13 @@ public class SdoClient implements CanBusListener {
             int chunk = 7 - unused;
             accumulator.write(response, 1, chunk);
             if (last) {
-                return accumulator.toByteArray();
+                byte[] result = accumulator.toByteArray();
+                if (totalSize >= 0 && result.length != totalSize) {
+                    sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
+                    throw new SdoException(AbortCode.SDO_PROTOCOL_ERROR,
+                            "uploaded " + result.length + " bytes, expected " + totalSize);
+                }
+                return result;
             }
             toggle ^= 1;
         }
@@ -213,12 +231,15 @@ public class SdoClient implements CanBusListener {
         }
     }
 
-    private void expectAck(byte[] response, int index, int subindex, int expectedCommand) {
+    private void expectAck(int nodeId, byte[] response, int index, int subindex,
+                           int expectedCommand) {
         if ((response[0] & 0xFF) != (expectedCommand & 0xFF)) {
+            sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
             throw protocolError(response[0] & 0xFF);
         }
         int responseIndex = u16(response, 1);
         if (responseIndex != index || (response[3] & 0xFF) != subindex) {
+            sendAbort(nodeId, index, subindex, AbortCode.SDO_PROTOCOL_ERROR);
             throw new SdoException(AbortCode.SDO_PROTOCOL_ERROR,
                     "SDO ack references different object");
         }

@@ -12,8 +12,11 @@ import java.io.ByteArrayOutputStream;
  * SDO 服务器（从站侧）。
  *
  * <ul>
- *   <li>不超过 4 字节的对象走加速传输，超过 4 字节走分段传输；</li>
- *   <li>分段传输严格校验 toggle 位，重复段被幂等忽略并原样重发上一应答；</li>
+ *   <li>不超过 4 字节的对象走加速传输，超过 4 字节（或 0 字节变长数据）走分段传输；</li>
+ *   <li>分段传输按 CiA 301 校验 toggle 位：请求 toggle 等于期望值时推进，
+ *       等于上一段（期望值取反）时识别为重复段并原样重发上一应答，其余情况拒绝；</li>
+ *   <li>传输正常结束后保留最近一次完成交换的应答，尾随后到的重复末段仍按相同结果回答，
+ *       不会被误判为协议错误；</li>
  *   <li>任何非法请求以标准中止码回答并立即释放会话；</li>
  *   <li>onTick 检测空闲超时，超时发送中止帧并释放会话，双方均可恢复。</li>
  * </ul>
@@ -29,6 +32,9 @@ public class SdoServer {
     private final CanOpenNode node;
 
     private Session session;
+    /** 最近一次成功完成的分段交换，用于识别尾随后到的重复末段。 */
+    private CompletedExchange completedDownload;
+    private CompletedExchange completedUpload;
     private long timeoutMillis = DEFAULT_TIMEOUT_MILLIS;
 
     public SdoServer(CanOpenNode node) {
@@ -54,8 +60,9 @@ public class SdoServer {
         byte[] data = frame.getData();
         int command = data[0] & 0xFF;
         if (command == ABORT_CS) {
-            // 客户端主动中止：释放匹配会话。
-            if (session != null && session.index == u16(data, 1) && session.subindex == data[3]) {
+            // 客户端主动中止：释放匹配会话（子索引按无符号比较）。
+            if (session != null && session.index == u16(data, 1)
+                    && session.subindex == (data[3] & 0xFF)) {
                 session = null;
             }
             return;
@@ -64,17 +71,24 @@ public class SdoServer {
         int index = u16(data, 1);
         int subindex = data[3] & 0xFF;
         try {
-            if ((command & 0xE0) == 0x00 && session != null && session.downloading) {
-                handleDownloadSegment(command, data);
-            } else if (command == 0x20 || command == 0x21
-                    || command == 0x22 || command == 0x23
-                    || ((command & 0xE0) == 0x20)) {
+            if ((command & 0xE0) == 0x00) {
+                // 下载段请求（ccs=0）。
+                if (session != null && session.downloading) {
+                    handleDownloadSegment(command, data);
+                } else {
+                    handleOrphanDownloadSegment(command, index, subindex);
+                }
+            } else if ((command & 0xE0) == 0x20) {
                 handleInitiateDownload(index, subindex, data);
             } else if (command == 0x40) {
                 handleInitiateUpload(index, subindex);
-            } else if (command == 0x60 && session != null
-                    && session.uploading) {
-                handleUploadSegment(command);
+            } else if ((command & 0xE0) == 0x60) {
+                // 上传段请求（ccs=3，toggle 在 bit4）。
+                if (session != null && session.uploading) {
+                    handleUploadSegment(command);
+                } else {
+                    handleOrphanUploadSegment(command, index, subindex);
+                }
             } else {
                 abort(index, subindex, AbortCode.SDO_COMMAND_SPECIFIER_INVALID);
             }
@@ -151,11 +165,12 @@ public class SdoServer {
         int subindex = current.subindex;
         int toggle = (command >>> 4) & 0x01;
         if (toggle != current.expectedToggle) {
-            if (toggle == (current.expectedToggle ^ 1) && current.lastAck != null) {
-                // 重复段：丢弃数据，原样重发上一应答（幂等）。
+            if (current.lastAck != null) {
+                // toggle 等于上一段：合法重复段，丢弃数据并原样重发上一应答（幂等）。
                 send(current.lastAck);
                 return;
             }
+            // 首段 toggle 不为 0：真正的乱序请求，拒绝并释放会话。
             throw new OdException(AbortCode.TOGGLE_BIT_INVALID);
         }
         boolean lastSegment = (command & 0x01) != 0;
@@ -180,8 +195,20 @@ public class SdoServer {
             OdEntry entry = node.getObjectDictionary().entry(index, subindex);
             Object value = SdoCodec.decodeValue(entry, complete);
             node.getObjectDictionary().write(index, subindex, value);
+            // 记录完成交换：末段的合法重复仍按相同应答处理。
+            completedDownload = new CompletedExchange(toggle, ack);
             session = null;
         }
+    }
+
+    /** 无活动会话时收到的下载段：只可能是已完成传输的重复末段或真正的乱序帧。 */
+    private void handleOrphanDownloadSegment(int command, int index, int subindex) {
+        int toggle = (command >>> 4) & 0x01;
+        if (completedDownload != null && completedDownload.lastRequestToggle == toggle) {
+            send(completedDownload.response);
+            return;
+        }
+        abort(index, subindex, AbortCode.SDO_COMMAND_SPECIFIER_INVALID);
     }
 
     // ---- 上传（客户端读服务器）----
@@ -192,7 +219,7 @@ public class SdoServer {
             throw new OdException(AbortCode.READ_ON_WRITE_ONLY);
         }
         byte[] payload = SdoCodec.encodeEntry(entry);
-        if (payload.length <= 4) {
+        if (payload.length >= 1 && payload.length <= 4) {
             int n = 4 - payload.length;
             byte[] response = new byte[8];
             response[0] = (byte) (0x43 | (n << 2) | 0x02 | 0x01);
@@ -204,6 +231,7 @@ public class SdoServer {
             return;
         }
 
+        // 超过 4 字节或 0 字节变长数据走分段传输（0 字节时客户端收到一个空末段）。
         Session newSession = new Session(index, subindex, node.getClock().nowMillis());
         newSession.uploading = true;
         newSession.expectedToggle = 0;
@@ -222,15 +250,20 @@ public class SdoServer {
 
     private void handleUploadSegment(int command) {
         Session current = session;
-        // 上传段请求固定为 0x60（不含 toggle）。客户端收到应答后才发下一个 0x60，
-        // 因此收到 0x60 即表示上一应答已确认；首段/重复首段由 expectedToggle==0 区分。
-        if (current.awaitingAck) {
-            // 上一段已确认，推进 toggle；awaitingAck 在发送后重新置位。
-            current.expectedToggle ^= 1;
+        int toggle = (command >>> 4) & 0x01;
+        if (toggle != current.expectedToggle) {
+            if (current.lastSegmentResponse != null) {
+                // toggle 等于上一段：合法重复请求，原样重发上一段应答（幂等，不推进偏移）。
+                send(current.lastSegmentResponse);
+                return;
+            }
+            // 首个上传段请求 toggle 不为 0：真正的乱序请求，拒绝并释放会话。
+            abort(current.index, current.subindex, AbortCode.TOGGLE_BIT_INVALID);
+            return;
         }
         int remaining = current.pendingData.length - current.pendingOffset;
         int chunk = Math.min(7, remaining);
-        boolean last = current.pendingOffset + chunk == current.pendingData.length;
+        boolean last = current.pendingOffset + chunk >= current.pendingData.length;
         int unused = 7 - chunk;
         byte[] response = new byte[8];
         response[0] = (byte) ((current.expectedToggle << 4) | (unused << 1)
@@ -239,11 +272,23 @@ public class SdoServer {
         current.pendingOffset += chunk;
         current.lastActivityMillis = node.getClock().nowMillis();
         current.lastSegmentResponse = response.clone();
-        current.awaitingAck = true;
+        current.expectedToggle ^= 1;
         send(response);
         if (last) {
+            // 记录完成交换：末段请求的合法重复仍按相同段应答。
+            completedUpload = new CompletedExchange(toggle, response);
             session = null;
         }
+    }
+
+    /** 无活动会话时收到的上传段请求：只可能是已完成传输的重复末段请求或乱序帧。 */
+    private void handleOrphanUploadSegment(int command, int index, int subindex) {
+        int toggle = (command >>> 4) & 0x01;
+        if (completedUpload != null && completedUpload.lastRequestToggle == toggle) {
+            send(completedUpload.response);
+            return;
+        }
+        abort(index, subindex, AbortCode.SDO_COMMAND_SPECIFIER_INVALID);
     }
 
     private void abort(int index, int subindex, AbortCode code) {
@@ -293,12 +338,23 @@ public class SdoServer {
         private byte[] pendingData;
         private int pendingOffset;
         private byte[] lastSegmentResponse;
-        private boolean awaitingAck;
 
         private Session(int index, int subindex, long nowMillis) {
             this.index = index;
             this.subindex = subindex;
             this.lastActivityMillis = nowMillis;
+        }
+    }
+
+    /** 一次成功完成的分段交换：末段请求 toggle 与对应应答帧。 */
+    private static final class CompletedExchange {
+
+        private final int lastRequestToggle;
+        private final byte[] response;
+
+        private CompletedExchange(int lastRequestToggle, byte[] response) {
+            this.lastRequestToggle = lastRequestToggle;
+            this.response = response.clone();
         }
     }
 }
