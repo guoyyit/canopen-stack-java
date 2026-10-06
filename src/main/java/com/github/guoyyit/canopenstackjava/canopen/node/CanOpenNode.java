@@ -11,7 +11,9 @@ import com.github.guoyyit.canopenstackjava.canopen.emcy.HeartbeatProducer;
 import com.github.guoyyit.canopenstackjava.canopen.nmt.NmtCommand;
 import com.github.guoyyit.canopenstackjava.canopen.nmt.NmtMaster;
 import com.github.guoyyit.canopenstackjava.canopen.nmt.NmtState;
+import com.github.guoyyit.canopenstackjava.canopen.od.AbortCode;
 import com.github.guoyyit.canopenstackjava.canopen.od.ObjectDictionary;
+import com.github.guoyyit.canopenstackjava.canopen.od.OdException;
 import com.github.guoyyit.canopenstackjava.canopen.pdo.PdoMapping;
 import com.github.guoyyit.canopenstackjava.canopen.pdo.PdoType;
 import com.github.guoyyit.canopenstackjava.canopen.pdo.Rpdo;
@@ -179,6 +181,24 @@ public class CanOpenNode {
 
     // ---- 包内协作方法（均假设已持有总线串行锁）----
 
+    /**
+     * 外部（SDO 通道）对象写入入口：在普通对象字典权限校验之外，
+     * 实现 CiA 301 预定义错误字段（0x1003:0）的特殊写语义——
+     * 仅允许写入 0 以清空错误历史与错误寄存器，写入其他值以可区分中止码拒绝。
+     */
+    public void writeExternal(int index, int subindex, Object value) {
+        if (index == 0x1003 && subindex == 0) {
+            long requested = value instanceof Number num ? num.longValue() : -1L;
+            if (requested != 0L) {
+                throw new OdException(AbortCode.VALUE_TOO_HIGH,
+                        "0x1003:0 only accepts 0 to clear the error history, got " + requested);
+            }
+            emergencyProducer.clearErrors();
+            return;
+        }
+        objectDictionary.write(index, subindex, value);
+    }
+
     public CanBus getBus() {
         return bus;
     }
@@ -226,6 +246,11 @@ public class CanOpenNode {
         }
         state = newState;
         heartbeatProducer.onStateChanged(clock.nowMillis());
+        if (newState == NmtState.STOPPED || newState == NmtState.INITIALISATION) {
+            // 停止/初始化态不再服务 SDO：立即释放会话（含完成墓碑），
+            // 保证并发迁移下结果确定、恢复通信后通道干净可用。
+            sdoServer.abortAllSessions();
+        }
         if (newState != NmtState.OPERATIONAL) {
             for (Tpdo tpdo : tpdos) {
                 tpdo.onLeaveOperational();

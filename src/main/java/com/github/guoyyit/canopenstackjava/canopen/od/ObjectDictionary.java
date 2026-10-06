@@ -55,6 +55,15 @@ public class ObjectDictionary {
         entry.setValue(value);
     }
 
+    /**
+     * 协议栈内部写入路径：绕过读/写权限校验（仍保留类型与范围校验），
+     * 供错误寄存器、错误条数等只读项由栈内逻辑自动维护时使用。
+     * 外部访问（SDO/本地 API）不得使用此路径修改只读项。
+     */
+    public void writeInternal(int index, int subindex, Object value) {
+        entry(index, subindex).setValue(value);
+    }
+
     public Set<OdKey> keys() {
         TreeSet<OdKey> sorted = new TreeSet<>(java.util.Comparator.comparingInt(OdKey::index)
                 .thenComparingInt(OdKey::subindex));

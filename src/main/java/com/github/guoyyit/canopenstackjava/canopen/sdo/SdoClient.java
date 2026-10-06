@@ -135,8 +135,9 @@ public class SdoClient implements CanBusListener {
         ByteArrayOutputStream accumulator = new ByteArrayOutputStream(Math.max(0, totalSize));
         int toggle = 0;
         while (true) {
+            // CiA 301：上传段请求为 0110 t 0000，toggle 与服务器期望保持同步。
             byte[] requestFrame = new byte[8];
-            requestFrame[0] = 0x60;
+            requestFrame[0] = (byte) (0x60 | (toggle << 4));
             byte[] response = request(nodeId, index, subindex, requestFrame);
             int command = response[0] & 0xFF;
             if ((command & 0xE0) != 0x00) {

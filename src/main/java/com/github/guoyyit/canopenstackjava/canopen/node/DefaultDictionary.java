@@ -22,7 +22,7 @@ final class DefaultDictionary {
         od.define(new OdEntry(0x1000, 0, "Device type",
                 DataType.UNSIGNED32, Access.READ_ONLY, 0L));
         od.define(new OdEntry(0x1001, 0, "Error register",
-                DataType.UNSIGNED8, Access.READ_WRITE, 0L, 0L, 255L));
+                DataType.UNSIGNED8, Access.READ_ONLY, 0L, 0L, 255L));
         od.define(new OdEntry(0x1003, 0, "Number of emergency errors",
                 DataType.UNSIGNED8, Access.READ_WRITE, 0L, 0L, 254L));
         for (int i = 1; i <= 8; i++) {

@@ -27,7 +27,6 @@ public class EmergencyProducer {
 
     public void raiseError(int emergencyCode, byte manufacturerSpecific0to4) {
         errorRegister |= GENERIC_ERROR_BIT;
-        syncErrorRegister();
         EmergencyMessage message = new EmergencyMessage(
                 node.getNodeId(),
                 ++sequence,
@@ -36,6 +35,8 @@ public class EmergencyProducer {
                 errorRegister,
                 manufacturerBytes(manufacturerSpecific0to4));
         history.append(message);
+        // 历史更新后再同步：0x1001 与 0x1003 条数必须反映最新状态。
+        syncErrorRegister();
         if (node.getState() == NmtState.PRE_OPERATIONAL
                 || node.getState() == NmtState.OPERATIONAL) {
             byte[] payload = new byte[8];
@@ -72,9 +73,36 @@ public class EmergencyProducer {
         syncErrorRegister();
     }
 
+    /**
+     * 清空全部错误历史并将错误寄存器归零（对应 CiA 301 向 0x1003:0 写 0 的语义）。
+     * 清空后 0x1001、0x1003:0 与 0x1003 各子项对外读出一致归零。
+     */
+    public void clearErrors() {
+        history.clear();
+        errorRegister = 0;
+        syncErrorRegister();
+    }
+
     private void syncErrorRegister() {
-        node.getObjectDictionary().write(0x1001, 0, (long) (errorRegister & 0xFF));
-        node.getObjectDictionary().write(0x1003, 0, (long) Math.min(history.size(), 254));
+        // 只读项只能经内部路径由栈内逻辑维护，外部写入一律被拒绝。
+        node.getObjectDictionary().writeInternal(0x1001, 0, (long) (errorRegister & 0xFF));
+        node.getObjectDictionary().writeInternal(0x1003, 0, (long) Math.min(history.size(), 254));
+        syncErrorField();
+    }
+
+    /** 将最近的错误记录镜像到 0x1003 子项 1..8（sub1 为最新，低位紧急码、高位错误寄存器）。 */
+    private void syncErrorField() {
+        java.util.List<EmergencyMessage> all = history.all();
+        for (int sub = 1; sub <= 8; sub++) {
+            long field = 0L;
+            int messageIndex = all.size() - sub;
+            if (messageIndex >= 0) {
+                EmergencyMessage message = all.get(messageIndex);
+                field = (message.emergencyCode() & 0xFFFFL)
+                        | ((long) (message.errorRegister() & 0xFF) << 16);
+            }
+            node.getObjectDictionary().writeInternal(0x1003, sub, field);
+        }
     }
 
     private static byte[] manufacturerBytes(byte pattern) {
