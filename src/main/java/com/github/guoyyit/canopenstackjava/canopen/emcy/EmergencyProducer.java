@@ -27,7 +27,6 @@ public class EmergencyProducer {
 
     public void raiseError(int emergencyCode, byte manufacturerSpecific0to4) {
         errorRegister |= GENERIC_ERROR_BIT;
-        syncErrorRegister();
         EmergencyMessage message = new EmergencyMessage(
                 node.getNodeId(),
                 ++sequence,
@@ -36,6 +35,8 @@ public class EmergencyProducer {
                 errorRegister,
                 manufacturerBytes(manufacturerSpecific0to4));
         history.append(message);
+        // 必须在历史追加之后同步：条数与错误字段始终反映最新状态。
+        syncErrorRegister();
         if (node.getState() == NmtState.PRE_OPERATIONAL
                 || node.getState() == NmtState.OPERATIONAL) {
             byte[] payload = new byte[8];
