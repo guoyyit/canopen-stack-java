@@ -63,11 +63,29 @@ public class CanOpenNode {
         this.emergencyProducer = new EmergencyProducer(this, emergencyHistory);
         this.heartbeatProducer = new HeartbeatProducer(this);
         this.sdoServer = new SdoServer(this);
+        objectDictionary.setWriteInterceptor(this::interceptWrite);
         for (int i = 0; i < PDO_CHANNEL_COUNT; i++) {
             tpdos[i] = new Tpdo(this, i);
             rpdos[i] = new Rpdo(this, i);
         }
         this.busListener = this::handleFrame;
+    }
+
+    /**
+     * 对象字典外部写入拦截：0x1003:0 只允许写入 0（清空错误历史与错误寄存器），
+     * 其他值以可区分的中止码拒绝。
+     */
+    private void interceptWrite(int index, int subindex, Object value) {
+        if (index != 0x1003 || subindex != 0) {
+            return;
+        }
+        long longValue = value instanceof Number num ? num.longValue() : -1L;
+        if (longValue != 0L) {
+            throw new com.github.guoyyit.canopenstackjava.canopen.od.OdException(
+                    com.github.guoyyit.canopenstackjava.canopen.od.AbortCode.VALUE_RANGE_OVERFLOW,
+                    "0x1003:0 only accepts 0 (clear error history), got " + longValue);
+        }
+        emergencyProducer.clearErrors();
     }
 
     public int getNodeId() {
@@ -230,6 +248,11 @@ public class CanOpenNode {
             for (Tpdo tpdo : tpdos) {
                 tpdo.onLeaveOperational();
             }
+        }
+        if (newState == NmtState.STOPPED || newState == NmtState.INITIALISATION) {
+            // 停止/初始化态不再处理 SDO：立即释放会话，与对端超时释放共同保证
+            // 双方最终一致，不出现单侧悬挂。
+            sdoServer.abortAllSessions();
         }
     }
 

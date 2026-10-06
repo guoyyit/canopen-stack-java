@@ -72,9 +72,36 @@ public class EmergencyProducer {
         syncErrorRegister();
     }
 
+    /**
+     * 清空错误历史与错误寄存器（对应向 0x1003:0 写 0 的 CiA 301 语义）。
+     * 清空后历史、对外读出条数与错误寄存器一致归零。
+     */
+    public void clearErrors() {
+        history.clear();
+        errorRegister = 0;
+        syncErrorRegister();
+    }
+
     private void syncErrorRegister() {
-        node.getObjectDictionary().write(0x1001, 0, (long) (errorRegister & 0xFF));
-        node.getObjectDictionary().write(0x1003, 0, (long) Math.min(history.size(), 254));
+        // 只读项的自动状态同步走内部写入路径，不受对外只读限制影响。
+        node.getObjectDictionary().writeInternal(0x1001, 0, (long) (errorRegister & 0xFF));
+        node.getObjectDictionary().writeInternal(0x1003, 0, (long) Math.min(history.size(), 254));
+        syncErrorField();
+    }
+
+    /** 将最近最多 8 条历史同步到 0x1003:1..8（最新在子索引 1），其余清零。 */
+    private void syncErrorField() {
+        java.util.List<EmergencyMessage> all = history.all();
+        for (int sub = 1; sub <= 8; sub++) {
+            long field = 0L;
+            int historyIndex = all.size() - sub;
+            if (historyIndex >= 0) {
+                EmergencyMessage message = all.get(historyIndex);
+                field = (message.emergencyCode() & 0xFFFFL)
+                        | ((message.errorRegister() & 0xFFL) << 16);
+            }
+            node.getObjectDictionary().writeInternal(0x1003, sub, field);
+        }
     }
 
     private static byte[] manufacturerBytes(byte pattern) {
